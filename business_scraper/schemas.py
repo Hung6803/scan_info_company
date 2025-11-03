@@ -2,7 +2,7 @@
 Pydantic schemas cho API
 """
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, date
 from ninja import Schema
 from decimal import Decimal
 
@@ -16,7 +16,7 @@ class BusinessSchema(Schema):
     phone: Optional[str] = None
     email: Optional[str] = None
     address: Optional[str] = None
-    issue_date: Optional[str] = None
+    issue_date: Optional[date] = None
     status: Optional[str] = None
     website: Optional[str] = None
     description: Optional[str] = None
