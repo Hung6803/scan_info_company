@@ -38,6 +38,7 @@ class HSCTVNScraper:
         self.headless = headless
         self.timeout = timeout
         self.base_url = "https://hsctvn.com"
+        self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
 
@@ -52,38 +53,69 @@ class HSCTVNScraper:
 
     async def _setup_browser(self):
         """Setup Playwright browser with stealth mode"""
-        p = await async_playwright().start()
+        try:
+            logger.info("Starting Playwright browser setup...")
 
-        self.browser = await p.chromium.launch(
-            headless=self.headless,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox'
-            ]
-        )
+            # Start Playwright and store the instance
+            self.playwright = await async_playwright().start()
+            logger.info("Playwright started successfully")
 
-        self.context = await self.browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
+            # Launch browser
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.headless,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
+            logger.info("Browser launched successfully")
 
-        # Remove webdriver detection
-        await self.context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
+            # Create browser context
+            self.context = await self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            logger.info("Browser context created successfully")
 
-        logger.info("Browser setup complete")
+            # Remove webdriver detection
+            await self.context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+
+            logger.info("Browser setup complete - Ready to scrape")
+
+        except Exception as e:
+            logger.error(f"Failed to setup browser: {str(e)}")
+            # Clean up any partial initialization
+            if self.context:
+                await self.context.close()
+                self.context = None
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+            raise RuntimeError(f"Browser setup failed: {str(e)}") from e
 
     async def close(self):
-        """Close browser"""
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        logger.info("Browser closed")
+        """Close browser and cleanup resources"""
+        try:
+            if self.context:
+                await self.context.close()
+                self.context = None
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+            logger.info("Browser closed and resources cleaned up")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
 
     async def scrape(
         self,
@@ -116,9 +148,17 @@ class HSCTVNScraper:
         logger.info(f"Max results: {max_results}")
         logger.info("="*60)
 
-        # Setup browser if not already done
-        if not self.browser:
+        # Setup browser if not already done or if browser is disconnected
+        if not self.browser or not self.browser.is_connected():
+            # Close old browser if exists but disconnected
+            if self.browser:
+                logger.info("Browser disconnected, cleaning up and reinitializing...")
+                await self.close()
             await self._setup_browser()
+
+        # Validate browser and context are ready
+        if not self.browser or not self.context:
+            raise RuntimeError("Browser initialization failed - browser or context is None")
 
         # Build URL
         url = f"{self.base_url}/ngay-{day}/{month}/{year}"
@@ -195,6 +235,9 @@ class HSCTVNScraper:
             raise
         finally:
             await page.close()
+            # Close browser after scraping to prevent connection issues on next request
+            logger.info("Cleaning up browser resources after scraping...")
+            await self.close()
 
     async def _get_total_companies(self, page: Page) -> int:
         """
@@ -208,33 +251,38 @@ class HSCTVNScraper:
         """
         try:
             # Look for heading like "tìm thấy 784 hồ sơ công ty | trang 1"
+            # or "tìm thấy <label>1,021</label> hồ sơ công ty | trang 1"
             content = await page.content()
 
             # Log content for debugging
             logger.debug(f"Page content length: {len(content)} chars")
 
-            # Try multiple patterns
+            # Try multiple patterns - handle numbers with commas (1,021) or dots (1.021)
             patterns = [
-                r'tìm thấy\s+(\d+)\s+hồ sơ\s+công ty',  # "tìm thấy 784 hồ sơ công ty"
-                r'tìm thấy\s+(\d+)\s+hồ sơ',  # "tìm thấy 784 hồ sơ"
-                r'(\d+)\s+hồ sơ\s+công ty',  # "784 hồ sơ công ty"
-                r'<h\d+[^>]*>.*?(\d+)\s+hồ sơ.*?</h\d+>',  # In heading tag
+                r'tìm thấy\s+<label>([\d,\.]+)</label>\s+hồ sơ',  # "tìm thấy <label>1,021</label> hồ sơ"
+                r'tìm thấy\s+([\d,\.]+)\s+hồ sơ\s+công ty',  # "tìm thấy 1,021 hồ sơ công ty"
+                r'tìm thấy\s+([\d,\.]+)\s+hồ sơ',  # "tìm thấy 1,021 hồ sơ"
+                r'([\d,\.]+)\s+hồ sơ\s+công ty',  # "1,021 hồ sơ công ty"
+                r'<h\d+[^>]*>.*?([\d,\.]+)\s+hồ sơ.*?</h\d+>',  # In heading tag
             ]
 
             for pattern in patterns:
                 match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
                 if match:
-                    count = int(match.group(1))
-                    logger.info(f"Found company count using pattern: {pattern[:50]}")
+                    # Extract number and remove commas/dots
+                    number_str = match.group(1).replace(',', '').replace('.', '')
+                    count = int(number_str)
+                    logger.info(f"Found company count: {count} (original: {match.group(1)})")
                     return count
 
             # If regex fails, try to find via text content
             try:
                 text_content = await page.inner_text('body')
-                match = re.search(r'tìm thấy\s+(\d+)\s+hồ sơ', text_content, re.IGNORECASE)
+                match = re.search(r'tìm thấy\s+([\d,\.]+)\s+hồ sơ', text_content, re.IGNORECASE)
                 if match:
-                    count = int(match.group(1))
-                    logger.info("Found company count in page text")
+                    number_str = match.group(1).replace(',', '').replace('.', '')
+                    count = int(number_str)
+                    logger.info(f"Found company count in page text: {count}")
                     return count
             except Exception:
                 pass
@@ -397,6 +445,11 @@ class HSCTVNScraper:
         Returns:
             Dict with additional company data or None
         """
+        # Validate context before creating page
+        if not self.context:
+            logger.error("Browser context is None - cannot create new page")
+            return None
+
         page = await self.context.new_page()
 
         try:
