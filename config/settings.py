@@ -11,13 +11,23 @@ load_dotenv()
 # Build paths inside the project
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-development-key-change-in-production')
+def _env_bool(key: str, default: str = "False") -> bool:
+    val = os.getenv(key, str(default))
+    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+def env_list(key: str, default: str = "") -> list[str]:
+    raw = os.getenv(key, default)
+    return [x.strip() for x in str(raw).split(",") if x and x.strip()]
+
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret-key")
+
+DEBUG = _env_bool("DEBUG", "True")
+
+ALLOWED_HOSTS = env_list(
+    "ALLOWED_HOSTS",
+    "localhost,127.0.0.1,0.0.0.0,[::1]",
+)
 
 # Application definition
 INSTALLED_APPS = [
