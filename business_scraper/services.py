@@ -214,6 +214,14 @@ class BusinessScraperService:
                     except Exception:
                         issue_date = None
 
+                # Check for duplicates by phone
+                phone = business_data.get('phone')
+                if phone:
+                    exists = await sync_to_async(Business.objects.filter(phone=phone).exists)()
+                    if exists:
+                        logger.info(f"Bỏ qua doanh nghiệp trùng SĐT: {phone}")
+                        continue
+
                 await sync_to_async(Business.objects.create)(
                     search_query=search_query,
                     name=business_data.get('name', ''),

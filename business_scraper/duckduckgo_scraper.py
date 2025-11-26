@@ -9,6 +9,7 @@ import re
 from typing import List, Dict, Optional
 from playwright.async_api import async_playwright, Page, Browser
 from urllib.parse import urlparse
+from .ai_services import GeminiService
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class DuckDuckGoScraper:
         self.timeout = timeout
         self.browser = None
         self.context = None
+        self.ai_service = GeminiService()
 
     async def scrape(self, keyword: str, location: str = "", max_results: int = 10) -> List[Dict]:
         """
@@ -288,13 +290,6 @@ class DuckDuckGoScraper:
         Scrape business information from each website
         Now supports extracting MULTIPLE businesses per website (e.g. "Top 10" lists)
         with deduplication by phone number and business name
-
-        Args:
-            url_data: List of dicts with 'url', 'title', 'snippet'
-            max_results: Max number of businesses to extract
-
-        Returns:
-            List of business data (deduplicated)
         """
         businesses = []
         seen_phones = set()  # Track unique phone numbers
@@ -322,6 +317,10 @@ class DuckDuckGoScraper:
 
                         # Deduplication check
                         phone = business.get('phone')
+                        if isinstance(phone, list):
+                            phone = phone[0] if phone else None
+                            business['phone'] = phone
+                            
                         name = business.get('name', '').lower().strip()
 
                         # Skip if phone already seen
@@ -353,266 +352,41 @@ class DuckDuckGoScraper:
         logger.info(f"Total unique businesses after deduplication: {len(businesses)}")
         return businesses
 
-    async def _extract_from_website(self, url: str, search_result: Dict) -> Optional[Dict]:
-        """
-        Extract business information from a single website
-
-        Args:
-            url: Website URL
-            search_result: Dict with 'title', 'snippet' from search
-
-        Returns:
-            Business data dict or None
-        """
-        page = await self.context.new_page()
-
-        try:
-            # Go to website
-            await page.goto(url, wait_until='domcontentloaded', timeout=15000)
-            await asyncio.sleep(2)
-
-            # Get page content
-            content = await page.content()
-
-            # Extract business info
-            data = {
-                'name': search_result.get('title', ''),
-                'phone': None,
-                'email': None,
-                'address': None,
-                'website': url,
-                'description': search_result.get('snippet', ''),
-                'source': 'duckduckgo'
-            }
-
-            # Extract phone numbers
-            phone = self._extract_phone(content)
-            if phone:
-                data['phone'] = phone
-
-            # Extract emails
-            email = self._extract_email(content)
-            if email:
-                data['email'] = email
-
-            # Extract address (Vietnamese)
-            address = self._extract_address(content)
-            if address:
-                data['address'] = address
-
-            # Clean business name
-            if not data['name']:
-                # Try to get from page title
-                title = await page.title()
-                data['name'] = title[:200] if title else urlparse(url).netloc
-
-            return data if (data['phone'] or data['email'] or data['address']) else None
-
-        except Exception as e:
-            logger.debug(f"Extract error for {url}: {str(e)}")
-            return None
-        finally:
-            await page.close()
-
-    def _extract_phone(self, text: str) -> Optional[str]:
-        """Extract FIRST Vietnamese phone number from text"""
-        # Vietnamese phone patterns
-        patterns = [
-            r'(?:\+84|84|0)[\s\.\-]?[1-9]\d{1,2}[\s\.\-]?\d{3}[\s\.\-]?\d{3,4}',  # +84 xxx xxx xxx
-            r'0[1-9]\d{8,9}',  # 0xxxxxxxxx
-            r'\+84[1-9]\d{8,9}',  # +84xxxxxxxxx
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                phone = match.group(0)
-                # Clean up
-                phone = re.sub(r'[\s\.\-]', '', phone)
-                return phone
-
-        return None
-
-    def _extract_all_phones(self, text: str) -> List[str]:
-        """Extract ALL Vietnamese phone numbers from text"""
-        phones = []
-        seen = set()
-
-        # Vietnamese phone patterns
-        patterns = [
-            r'(?:\+84|84|0)[\s\.\-]?[1-9]\d{1,2}[\s\.\-]?\d{3}[\s\.\-]?\d{3,4}',  # +84 xxx xxx xxx
-            r'0[1-9]\d{8,9}',  # 0xxxxxxxxx
-            r'\+84[1-9]\d{8,9}',  # +84xxxxxxxxx
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                # Clean up
-                phone = re.sub(r'[\s\.\-]', '', match)
-                # Deduplicate
-                if phone not in seen and len(phone) >= 10:
-                    phones.append(phone)
-                    seen.add(phone)
-
-        return phones
-
-    def _extract_email(self, text: str) -> Optional[str]:
-        """Extract FIRST email from text"""
-        pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        match = re.search(pattern, text)
-        if match:
-            email = match.group(0)
-            # Skip common generic emails
-            if not any(x in email.lower() for x in ['example.com', 'test.com', 'domain.com']):
-                return email
-        return None
-
-    def _extract_all_emails(self, text: str) -> List[str]:
-        """Extract ALL emails from text"""
-        emails = []
-        seen = set()
-        pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        matches = re.findall(pattern, text)
-
-        for email in matches:
-            # Skip generic emails
-            if any(x in email.lower() for x in ['example.com', 'test.com', 'domain.com', 'sampleemail']):
-                continue
-            # Deduplicate
-            if email.lower() not in seen:
-                emails.append(email)
-                seen.add(email.lower())
-
-        return emails
-
-    def _extract_all_addresses(self, text: str) -> List[str]:
-        """Extract ALL Vietnamese addresses from text"""
-        addresses = []
-        seen = set()
-
-        # Vietnamese address patterns
-        patterns = [
-            r'Địa chỉ[:\s]+([^\n<>]{20,200})',
-            r'Address[:\s]+([^\n<>]{20,200})',
-            r'\d+\s+(?:Phố|Đường|P\.|Quận|Q\.)[^\n<>]{10,150}',
-            r'(?:Số|số)\s+\d+[,\s]+(?:Phố|Đường|phố|đường)[^\n<>]{10,150}',
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                # Handle tuple results from groups
-                address = match if isinstance(match, str) else match[0] if match else ''
-                address = address.strip()
-                # Clean HTML tags
-                address = re.sub(r'<[^>]+>', '', address)
-                # Validate length
-                if 10 < len(address) < 300:
-                    # Deduplicate
-                    address_lower = address.lower()
-                    if address_lower not in seen:
-                        addresses.append(address)
-                        seen.add(address_lower)
-
-        return addresses
-
-    def _extract_address(self, text: str) -> Optional[str]:
-        """Extract Vietnamese address from text"""
-        # Look for common Vietnamese address patterns
-        patterns = [
-            r'Địa chỉ[:\s]+([^\n<>]{20,200})',
-            r'Address[:\s]+([^\n<>]{20,200})',
-            r'\d+\s+(?:Phố|Đường|P\.|Quận|Q\.)[^\n<>]{10,150}',
-            r'(?:Số|số)\s+\d+[,\s]+(?:Phố|Đường|phố|đường)[^\n<>]{10,150}',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                address = match.group(1) if match.lastindex else match.group(0)
-                address = address.strip()
-                # Clean HTML tags
-                address = re.sub(r'<[^>]+>', '', address)
-                if 10 < len(address) < 300:
-                    return address
-
-        return None
-
     async def _extract_all_from_website(self, url: str, search_result: Dict) -> List[Dict]:
         """
-        Extract ALL businesses from a single website
-        Useful for "Top 10" or listing pages
-
-        Args:
-            url: Website URL
-            search_result: Dict with 'title', 'snippet' from search
-
-        Returns:
-            List of business data dicts
+        Extract ALL businesses from a single website using Gemini AI
         """
         page = await self.context.new_page()
-        businesses = []
-
+        
         try:
             # Go to website
             await page.goto(url, wait_until='domcontentloaded', timeout=15000)
             await asyncio.sleep(2)
 
-            # Get page content
-            content = await page.content()
+            # Get page text content (better for LLM than raw HTML)
+            # We use evaluate to get innerText of body, which is cleaner
+            text_content = await page.evaluate("document.body.innerText")
+            
+            # If text is too short, try getting full HTML content but strip tags
+            if len(text_content) < 200:
+                 text_content = await page.content()
 
-            # Extract ALL contact info
-            all_phones = self._extract_all_phones(content)
-            all_emails = self._extract_all_emails(content)
-            all_addresses = self._extract_all_addresses(content)
+            logger.info(f"  Sending {len(text_content)} chars to Gemini...")
 
-            logger.debug(f"  Found {len(all_phones)} phones, {len(all_emails)} emails, {len(all_addresses)} addresses")
+            # Use Gemini to extract
+            if self.ai_service.model:
+                businesses = self.ai_service.extract_multiple_businesses(text_content, url)
+                if businesses:
+                    return businesses
+            
+            # Fallback to single extraction if multiple failed or returned empty
+            # Or if we just want to try the single extraction method
+            if self.ai_service.model:
+                 single_business = self.ai_service.extract_business_info(text_content, url)
+                 if single_business:
+                     return [single_business]
 
-            # Strategy: Create one business per unique phone number
-            if all_phones:
-                for idx, phone in enumerate(all_phones):
-                    # Try to pair with email and address
-                    email = all_emails[idx] if idx < len(all_emails) else None
-                    address = all_addresses[idx] if idx < len(all_addresses) else None
-
-                    # Generate business name from title or domain
-                    if len(all_phones) == 1:
-                        # Single business - use title as-is
-                        name = search_result.get('title', '')
-                    else:
-                        # Multiple businesses - append index
-                        base_name = search_result.get('title', urlparse(url).netloc)
-                        name = f"{base_name} #{idx + 1}"
-
-                    business = {
-                        'name': name or urlparse(url).netloc,
-                        'phone': phone,
-                        'email': email,
-                        'address': address,
-                        'website': url,
-                        'description': search_result.get('snippet', ''),
-                        'source': 'duckduckgo'
-                    }
-                    businesses.append(business)
-
-            # Fallback: If no phones, try to create at least one business with emails/addresses
-            elif all_emails or all_addresses:
-                email = all_emails[0] if all_emails else None
-                address = all_addresses[0] if all_addresses else None
-
-                business = {
-                    'name': search_result.get('title', '') or urlparse(url).netloc,
-                    'phone': None,
-                    'email': email,
-                    'address': address,
-                    'website': url,
-                    'description': search_result.get('snippet', ''),
-                    'source': 'duckduckgo'
-                }
-                businesses.append(business)
-
-            return businesses
+            return []
 
         except Exception as e:
             logger.debug(f"Extract error for {url}: {str(e)}")
